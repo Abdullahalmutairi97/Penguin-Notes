@@ -1,0 +1,26 @@
+[package]
+name = "penguin-notes"
+version = "0.6.0"
+edition = "2024"
+
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+eframe = "0.36.2"
+roxmltree = "0.21.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.4.2", features = ["json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+
+# Local fix for right-to-left (Arabic) glyph counting; see vendor/epaint/src/text/text_layout.rs.
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }

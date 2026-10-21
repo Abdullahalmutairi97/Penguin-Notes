@@ -345,6 +345,11 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// What to check when the server can't be reached.
+fn hint(name: &str) -> &'static str {
+    if name.ends_with(".ts.net") { " (is Tailscale on?)" } else { " (check the internet connection and the server name)" }
+}
+
 impl Imap {
     fn connect(host: &str) -> Result<Self, String> {
         let (name, port) = match host.rsplit_once(':') {
@@ -352,9 +357,9 @@ impl Imap {
             _ => (host.to_string(), 993),
         };
         let tcp = std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port))
-            .map_err(|_| format!("can't find {name} (is Tailscale on?)"))?
+            .map_err(|_| format!("can't find {name}{}", hint(&name)))?
             .find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(10)).ok())
-            .ok_or_else(|| format!("can't reach {name} (is Tailscale on?)"))?;
+            .ok_or_else(|| format!("can't reach {name}{}", hint(&name)))?;
         tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
         tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
         let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -485,7 +490,9 @@ pub fn sync_in(c: &Creds, folder: &str, notes: &[Note], mut st: State) -> Result
         return Err("enter the server, user name and password".into());
     }
     let mut im = Imap::connect(c.host.trim())?;
-    im.cmd(&format!("LOGIN {} {}", quote(c.user.trim()), quote(&c.pass)))
+    // Google shows app passwords as "abcd efgh ijkl mnop"; the spaces aren't part of it.
+    let pass = if c.host.contains("gmail.com") { c.pass.replace(' ', "") } else { c.pass.clone() };
+    im.cmd(&format!("LOGIN {} {}", quote(c.user.trim()), quote(&pass)))
         .map_err(|_| "user name or password was rejected".to_string())?;
     let sel = match im.cmd(&format!("SELECT {}", quote(folder))) {
         Ok(r) => r,

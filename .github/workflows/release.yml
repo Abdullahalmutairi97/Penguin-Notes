@@ -1,0 +1,101 @@
+# Builds the downloads. Push a tag like v0.6.0 to publish them as a GitHub release;
+# run it by hand (Actions > Release > Run workflow) to only build and test them.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # whisper.cpp build whose ready-made binaries ship inside the app (for voice).
+  WHISPER: b5454
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  linux:
+    # The oldest supported runner: the app then runs on any distro with glibc 2.35 or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # mesa-vulkan-drivers: a software GPU, so the UI tests can render their screenshots.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev mesa-vulkan-drivers
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - name: Bundle
+        run: |
+          d=dist/penguin-notes
+          mkdir -p $d/whisper
+          cp target/release/penguin-notes $d/
+          cp assets/icon.png packaging/linux/install.sh $d/
+          gh release download $WHISPER -R ggml-org/whisper.cpp -p whisper-bin-ubuntu-x64.tar.gz -D /tmp
+          tar -xzf /tmp/whisper-bin-ubuntu-x64.tar.gz -C /tmp
+          w=/tmp/whisper-bin-ubuntu-x64
+          cp -a $w/whisper-cli $w/libwhisper.so* $w/libggml*.so* $w/LICENSE $d/whisper/
+          # whisper's CPU code uses OpenMP; not every desktop has libgomp installed.
+          cp -L /usr/lib/x86_64-linux-gnu/libgomp.so.1 $d/whisper/
+          tar -czf dist/penguin-notes-linux-x86_64.tar.gz -C dist penguin-notes
+          cp packaging/linux/install.sh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/penguin-notes-linux-x86_64.tar.gz
+            dist/install.sh
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The tests run on Linux; they need a GPU to render, which this runner lacks.
+      - run: cargo build --release --locked
+      - name: Bundle
+        run: |
+          d=dist/penguin-notes
+          mkdir -p $d/whisper
+          cp target/release/penguin-notes.exe $d/
+          gh release download $WHISPER -R ggml-org/whisper.cpp -p whisper-bin-x64.zip -D /tmp
+          unzip -q /tmp/whisper-bin-x64.zip -d /tmp/whisper
+          w=/tmp/whisper/Release
+          cp $w/whisper-cli.exe $w/whisper.dll $w/ggml.dll $w/ggml-base.dll $w/ggml-cpu-*.dll $d/whisper/
+          # whisper.cpp links the VC++ runtime; ship it so nobody has to install it.
+          for f in msvcp140.dll vcruntime140.dll vcruntime140_1.dll vcomp140.dll; do
+            cp "/c/Windows/System32/$f" $d/whisper/
+          done
+      - name: Installer
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          iscc=$(ls "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" 2>/dev/null || true)
+          if [ -z "$iscc" ]; then choco install innosetup -y --no-progress; iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"; fi
+          "$iscc" "//DVersion=$v" "//DDist=$(cygpath -w "$PWD/dist")" packaging/windows/penguin-notes.iss
+          (cd dist && 7z a -tzip penguin-notes-windows-x64.zip penguin-notes > /dev/null)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/PenguinNotes-Setup.exe
+            dist/penguin-notes-windows-x64.zip
+
+  release:
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "Penguin Notes ${GITHUB_REF_NAME#v}" --notes-file packaging/release-notes.md

@@ -744,10 +744,10 @@ impl App {
             match self.voice {
                 voice::Voice::Idle => {
                     self.ai_open = true;
-                    self.start_talking();
+                    self.start_talking(ctx);
                 }
                 voice::Voice::Recording { .. } => self.voice.stop(ctx, &self.voice_lang),
-                voice::Voice::Transcribing { .. } => {}
+                voice::Voice::Downloading { .. } | voice::Voice::Transcribing { .. } => {}
             }
         }
         if ctx.input_mut(|i| i.consume_key(cmd | Modifiers::SHIFT, Key::Backslash)) {
@@ -1814,7 +1814,7 @@ impl App {
                     .on_hover_text("Talk to Pengu (Ctrl+Shift+Space): click, speak, click again to send")
                     .clicked()
                 {
-                    self.start_talking();
+                    self.start_talking(&ctx);
                 }
             }
             voice::Voice::Recording { since, .. } => {
@@ -1826,6 +1826,12 @@ impl App {
                 {
                     self.voice.stop(&ctx, &self.voice_lang);
                 }
+            }
+            voice::Voice::Downloading { got, .. } => {
+                let pct = got.load(std::sync::atomic::Ordering::Relaxed) * 100 / voice::MODEL_SIZE;
+                ctx.request_repaint_after(Duration::from_millis(250));
+                ui.add_enabled(false, egui::Label::new(RichText::new(format!("Getting voice ready… {pct}%")).size(13.0).color(p.ink_2)))
+                    .on_disabled_hover_text("Downloading the speech model (190 MB), once. After that, voice works offline.");
             }
             voice::Voice::Transcribing { .. } => {
                 ctx.request_repaint_after(Duration::from_millis(250));
@@ -1846,9 +1852,9 @@ impl App {
         }
     }
 
-    fn start_talking(&mut self) {
+    fn start_talking(&mut self, ctx: &egui::Context) {
         self.err.clear();
-        if let Err(e) = self.voice.start() {
+        if let Err(e) = self.voice.start(ctx) {
             self.err = e;
         }
     }

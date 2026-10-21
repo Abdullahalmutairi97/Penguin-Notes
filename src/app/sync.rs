@@ -446,10 +446,39 @@ impl App {
                     .size(13.0)
                     .color(p.ink_2),
             );
-            ui.add_space(4.0);
-            changed |= field(ui, "IMAP server", &mut self.sync.cfg.apple.host, "mail.example.com", false);
-            changed |= field(ui, "User name", &mut self.sync.cfg.apple.user, "notes", false);
-            changed |= field(ui, "Password", &mut self.sync.cfg.apple.pass, "", true);
+            ui.add_space(6.0);
+            // Most people already have a mail account the iPhone can keep notes in: pick it.
+            let host = self.sync.cfg.apple.host.trim().to_string();
+            let picked = MAIL.iter().find(|m| m.host == host);
+            ui.horizontal_wrapped(|ui| {
+                for m in MAIL {
+                    if pill(ui, p, m.name, picked.is_some_and(|x| x.name == m.name)).clicked() {
+                        self.sync.cfg.apple.host = m.host.into();
+                        changed = true;
+                    }
+                }
+                if pill(ui, p, "Other", picked.is_none() && !host.is_empty()).clicked() && picked.is_some() {
+                    self.sync.cfg.apple.host.clear();
+                    changed = true;
+                }
+            });
+            match picked {
+                Some(m) => {
+                    changed |= field(ui, "Email", &mut self.sync.cfg.apple.user, "you@example.com", false);
+                    changed |= field(ui, "App password", &mut self.sync.cfg.apple.pass, "not your normal password", true);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(RichText::new("Make one at ").size(12.5).color(p.ink_3));
+                        ui.hyperlink_to(RichText::new(m.link).size(12.5), m.url);
+                        ui.label(RichText::new(m.how).size(12.5).color(p.ink_3));
+                    });
+                }
+                None => {
+                    changed |= field(ui, "IMAP server", &mut self.sync.cfg.apple.host, "mail.example.com", false);
+                    changed |= field(ui, "User name", &mut self.sync.cfg.apple.user, "you@example.com", false);
+                    changed |= field(ui, "Password", &mut self.sync.cfg.apple.pass, "", true);
+                }
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let a = &mut self.sync.apple;
@@ -473,7 +502,11 @@ impl App {
                 };
                 ui.add(egui::Label::new(RichText::new(txt).size(12.5).color(col)).wrap());
             });
-            ui.label(RichText::new("On the iPhone: Settings > Apps > Mail > Mail Accounts > Add Account > Other > Add Mail Account, with the same server and login, then turn on Notes for it.").size(12.5).color(p.ink_3));
+            let phone = match picked {
+                Some(m) => format!("On the iPhone: Settings > Apps > Mail > Mail Accounts. Add your {} account if it isn't there, open it and turn on Notes. Its notes show under {} in the Notes app.", m.name, m.name),
+                None => "On the iPhone: Settings > Apps > Mail > Mail Accounts > Add Account > Other > Add Mail Account, with the same server and login, then turn on Notes for it.".into(),
+            };
+            ui.label(RichText::new(phone).size(12.5).color(p.ink_3));
 
             ui.add_space(12.0);
             ui.separator();
@@ -495,7 +528,7 @@ impl App {
                     }
                 } else {
                     if pill(ui, p, "Open folder", false).clicked() {
-                        let _ = std::process::Command::new("xdg-open").arg(expand(&self.sync.cfg.folder)).spawn();
+                        model::open(&expand(&self.sync.cfg.folder));
                     }
                     ui.label(RichText::new(&self.sync.mirror_msg).size(12.5).color(p.ink_2));
                 }
@@ -504,7 +537,11 @@ impl App {
             egui::Frame::new().fill(p.paper).stroke(Stroke::new(1.0, p.line)).corner_radius(8).inner_margin(10).show(ui, |ui| {
                 ui.label(RichText::new("Getting it onto the iPhone").size(13.5).family(bold()));
                 for step in [
-                    "1. Here: install Syncthing (sudo pacman -S syncthing) and run: systemctl --user enable --now syncthing",
+                    if cfg!(windows) {
+                        "1. Here: install Syncthing from syncthing.net (the Windows setup starts it with the computer)."
+                    } else {
+                        "1. Here: install Syncthing from your app store or package manager (e.g. sudo apt install syncthing), then run: systemctl --user enable --now syncthing"
+                    },
                     "2. iPhone: install Möbius Sync and Obsidian from the App Store.",
                     "3. In Obsidian on the iPhone, create a vault named Penguin Notes (not in iCloud).",
                     "4. In Möbius Sync, add this computer, then share the notes folder into Obsidian's “Penguin Notes” folder.",
@@ -523,11 +560,45 @@ impl App {
     }
 }
 
+/// Mail services whose accounts the iPhone can keep notes in, over IMAP with an app password.
+/// (Outlook.com is left out: it no longer takes passwords over IMAP.)
+pub struct Mail {
+    pub name: &'static str,
+    pub host: &'static str,
+    link: &'static str,
+    url: &'static str,
+    how: &'static str,
+}
+
+pub const MAIL: &[Mail] = &[
+    Mail {
+        name: "Gmail",
+        host: "imap.gmail.com",
+        link: "myaccount.google.com/apppasswords",
+        url: "https://myaccount.google.com/apppasswords",
+        how: " (needs 2-Step Verification on). Name it Penguin Notes and paste the 16 letters here.",
+    },
+    Mail {
+        name: "Yahoo",
+        host: "imap.mail.yahoo.com",
+        link: "login.yahoo.com/account/security",
+        url: "https://login.yahoo.com/account/security",
+        how: " > Generate app password.",
+    },
+    Mail {
+        name: "Fastmail",
+        host: "imap.fastmail.com",
+        link: "Fastmail settings",
+        url: "https://app.fastmail.com/settings/security/apps",
+        how: " > Privacy & Security > App passwords, with IMAP access.",
+    },
+];
+
 /// "~/x" -> "$HOME/x".
 pub fn expand(p: &str) -> String {
     let p = p.trim();
-    match (p.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+    match (p.strip_prefix("~/"), model::home()) {
+        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
         _ => p.to_string(),
     }
 }
@@ -636,6 +707,12 @@ mod tests {
         h.state_mut().calendar = false;
         h.run_steps(3);
         shot(&mut h, "18-iphone-sync-settings");
+        // Picking a mail service fills in its server and asks only for the login.
+        h.state_mut().sync.cfg.apple.host = "imap.gmail.com".into();
+        h.run_steps(3);
+        shot(&mut h, "18b-iphone-sync-gmail");
+        assert!(h.query_by_label_contains("myaccount.google.com/apppasswords").is_some());
+        assert!(h.query_by_label("IMAP server").is_none());
     }
 
     #[test]

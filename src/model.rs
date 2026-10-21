@@ -101,11 +101,25 @@ pub fn data_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join(format!("penguin-notes-test-{}", std::process::id()));
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
+    // Windows: %APPDATA%\penguin-notes; elsewhere the XDG data dir.
+    let base = std::env::var_os(if cfg!(windows) { "APPDATA" } else { "XDG_DATA_HOME" })
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| home().map(|h| h.join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("penguin-notes")
+}
+
+/// The user's home folder (HOME, or USERPROFILE on Windows).
+pub fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
+/// Opens a folder or link with the system's default app.
+pub fn open(target: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(target).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
 }
 
 pub fn write_atomic(name: &str, data: &str) {
@@ -116,8 +130,11 @@ pub fn write_atomic(name: &str, data: &str) {
     let tmp = dir.join(format!("{name}.tmp"));
     if std::fs::write(&tmp, data).is_ok() {
         // Notes and the API key are private: owner read/write only.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         let _ = std::fs::rename(&tmp, dir.join(name));
     }
 }
@@ -243,8 +260,8 @@ pub fn save_settings(s: &Settings) {
 }
 
 pub fn export_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Downloads"))
+    home()
+        .map(|h| h.join("Downloads"))
         .filter(|p| p.is_dir())
         .unwrap_or_else(data_dir)
 }

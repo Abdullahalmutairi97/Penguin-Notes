@@ -17,6 +17,7 @@ use crate::md::{self, Action, Block};
 use crate::model::{self, AiCfg, Note, PRESETS, Settings};
 use crate::pengu;
 use crate::theme::{self, Deco, Palette, bold, caps, pill, pill_ex, primary};
+use crate::voice;
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum View {
@@ -46,6 +47,8 @@ struct Msg {
     label: String,
     acts: Vec<pengu::Act>,
     undo: Vec<pengu::Undo>,
+    /// The trash before this reply was applied, if it removed or restored calendar items.
+    trash_before: Option<Vec<pengu::Deleted>>,
     state: ActState,
 }
 
@@ -57,6 +60,7 @@ impl Msg {
             label,
             acts: vec![],
             undo: vec![],
+            trash_before: None,
             state: ActState::Pending,
         }
     }
@@ -92,6 +96,9 @@ pub struct App {
     use_ctx: bool,
     pengu_edits: bool,
     actions_open: bool,
+    sidebar_open: bool,
+    topbar_open: bool,
+    voice_lang: String,
     /// Last known editor selection (char indices); `None` = end of note.
     sel: Option<(usize, usize)>,
     pending_sel: Option<(usize, usize)>,
@@ -103,6 +110,14 @@ pub struct App {
     dirty: bool,
     last_save: Instant,
     sync: sync::SyncRt,
+    voice: voice::Voice,
+    /// Calendar items Pengu removed, restorable for a day.
+    trash: Vec<pengu::Deleted>,
+    /// The notes and day files as last saved or read here, to notice the widget's changes.
+    seen: (Option<std::time::SystemTime>, Option<std::time::SystemTime>),
+    /// When the files on disk last matched what is in memory.
+    agreed: i64,
+    checked_disk: Instant,
 }
 
 impl App {
@@ -148,6 +163,9 @@ impl App {
             use_ctx: true,
             pengu_edits: s.pengu_edits,
             actions_open: s.actions_open,
+            sidebar_open: s.sidebar_open,
+            topbar_open: s.topbar_open,
+            voice_lang: if cfg!(test) { "en".into() } else { voice::lang() },
             sel: None,
             pending_sel: None,
             refocus: false,
@@ -158,6 +176,11 @@ impl App {
             dirty: false,
             last_save: Instant::now(),
             sync: sync::SyncRt::load(),
+            voice: voice::Voice::default(),
+            trash: if cfg!(test) { vec![] } else { pengu::load_trash() },
+            seen: (model::mtime("notes.json"), model::mtime("days.json")),
+            agreed: model::now_ms(),
+            checked_disk: Instant::now(),
         }
     }
 
@@ -187,6 +210,8 @@ impl App {
             ai: self.ai.clone(),
             pengu_edits: self.pengu_edits,
             actions_open: self.actions_open,
+            sidebar_open: self.sidebar_open,
+            topbar_open: self.topbar_open,
         });
     }
 
@@ -298,7 +323,10 @@ impl App {
             return;
         }
         let current = self.idx().filter(|_| self.use_ctx).map(|i| &self.notes[i]);
-        let sys = pengu::system_prompt(&self.notes, &self.days, current);
+        if pengu::purge(&mut self.trash) {
+            pengu::save_trash(&self.trash);
+        }
+        let sys = pengu::system_prompt(&self.notes, &self.days, current, &self.trash);
         self.msgs.push(Msg::new("user", content, label));
         let mut m = vec![("system".to_string(), sys)];
         m.extend(
@@ -319,8 +347,13 @@ impl App {
 
     /// Apply the actions in Pengu's reply `k` to the notes.
     fn pengu_apply(&mut self, k: usize) {
-        let (undo, show, day) = pengu::apply(&mut self.notes, &mut self.days, &self.msgs[k].acts);
+        let before = self.trash.clone();
+        let (undo, show, day) = pengu::apply(&mut self.notes, &mut self.days, &mut self.trash, &self.msgs[k].acts);
         self.msgs[k].undo = undo;
+        if self.trash != before {
+            self.msgs[k].trash_before = Some(before);
+            pengu::save_trash(&self.trash);
+        }
         self.msgs[k].state = ActState::Applied;
         self.dirty = true;
         self.saved = format!("Pengu saved {}", chrono::Local::now().format("%H:%M"));
@@ -338,6 +371,10 @@ impl App {
 
     fn pengu_undo(&mut self, k: usize) {
         pengu::revert(&mut self.notes, &mut self.days, &self.msgs[k].undo);
+        if let Some(before) = self.msgs[k].trash_before.take() {
+            pengu::undo_trash(&mut self.days, &mut self.trash, &before);
+            pengu::save_trash(&self.trash);
+        }
         self.msgs[k].undo.clear();
         self.msgs[k].state = ActState::Undone;
         self.dirty = true;
@@ -423,13 +460,55 @@ impl App {
         }
     }
 
+    /// Merge in what the desktop widget's Pengu saved while this window was open.
+    fn pick_up_outside_changes(&mut self) {
+        self.checked_disk = Instant::now();
+        // Tests run side by side over one temp data dir; they would pick up each other's saves.
+        if cfg!(test) {
+            return;
+        }
+        // The widget may have switched the Talk language.
+        self.voice_lang = voice::lang();
+        let now = (model::mtime("notes.json"), model::mtime("days.json"));
+        if now == self.seen {
+            return;
+        }
+        let mut changed = false;
+        if now.0 != self.seen.0 {
+            if let Some(disk) = model::read_list("notes.json") {
+                changed |= model::merge(&mut self.notes, disk, self.agreed);
+            }
+        }
+        if now.1 != self.seen.1 {
+            if let Some(disk) = model::read_list("days.json") {
+                changed |= model::merge(&mut self.days, disk, self.agreed);
+            }
+        }
+        self.trash = pengu::load_trash();
+        self.seen = now;
+        if changed {
+            // Saving writes the merged result back; `agreed` moves on then.
+            self.dirty = true;
+            if self.idx().is_none() {
+                self.active = self.notes.first().map(|n| n.id.clone());
+            }
+        }
+    }
+
     fn maybe_save(&mut self, ctx: &egui::Context) {
+        if self.checked_disk.elapsed() > Duration::from_secs(1) {
+            self.pick_up_outside_changes();
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if !self.dirty {
             return;
         }
         if self.last_save.elapsed() > Duration::from_millis(500) {
+            self.pick_up_outside_changes();
             model::save_notes(&self.notes);
             model::save_days(&self.days);
+            self.seen = (model::mtime("notes.json"), model::mtime("days.json"));
+            self.agreed = model::now_ms();
             self.dirty = false;
             self.last_save = Instant::now();
         } else {
@@ -584,14 +663,22 @@ impl App {
         }
         self.shortcuts(ctx);
 
-        self.sidebar(ui, &p);
+        if self.sidebar_open {
+            self.sidebar(ui, &p);
+        }
         if self.ai_open {
             self.ai_panel(ui, &p);
         }
-        self.topbar(ui, &p);
         let show_note = self.idx().is_some() && !self.calendar;
+        if self.topbar_open {
+            self.topbar(ui, &p);
+            if show_note {
+                self.toolbar(ui, &p);
+            }
+        } else {
+            self.folded_topbar(ui, &p);
+        }
         if show_note {
-            self.toolbar(ui, &p);
             self.footer(ui, &p);
         }
         egui::CentralPanel::default()
@@ -647,7 +734,27 @@ impl App {
             self.add_note("", "");
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::F)) {
+            if !self.sidebar_open {
+                self.sidebar_open = true;
+                self.save_settings();
+            }
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd | Modifiers::SHIFT, Key::Space)) {
+            match self.voice {
+                voice::Voice::Idle => {
+                    self.ai_open = true;
+                    self.start_talking();
+                }
+                voice::Voice::Recording { .. } => self.voice.stop(ctx, &self.voice_lang),
+                voice::Voice::Transcribing { .. } => {}
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd | Modifiers::SHIFT, Key::Backslash)) {
+            self.toggle_topbar();
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, Key::Backslash)) {
+            self.toggle_sidebar();
         }
         if self.idx().is_some() && !self.calendar {
             if ctx.input_mut(|i| i.consume_key(cmd, Key::B)) {
@@ -722,11 +829,31 @@ impl App {
                     )
                 });
                 let count = self.notes.len();
-                ui.label(caps(
-                    &format!("{count} {}", if count == 1 { "note" } else { "notes" }),
-                    p,
-                    10.5,
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(caps(
+                        &format!("{count} {}", if count == 1 { "note" } else { "notes" }),
+                        p,
+                        10.5,
+                    ));
+                    if self.sync.notes_on() {
+                        ui.with_layout(ELayout::right_to_left(Align::Center), |ui| {
+                            let busy = self.sync.notes_busy();
+                            let failed = self.sync.notes_status().starts_with("iPhone sync failed");
+                            let t = ui.input(|i| i.time) as f32;
+                            if busy {
+                                ui.ctx().request_repaint();
+                            }
+                            let r = icon_button(ui, p, "Refresh notes", |painter, r, col| {
+                                let col = if failed { p.accent } else { col };
+                                refresh_icon(painter, r.center(), col, if busy { t * 6.0 } else { 0.0 })
+                            })
+                            .on_hover_text(self.sync.notes_status());
+                            if r.clicked() && !busy {
+                                self.sync.notes_sync_now();
+                            }
+                        });
+                    }
+                });
                 ui.add_space(2.0);
                 let mut open = None;
                 let mut trash: Option<String> = None;
@@ -884,6 +1011,65 @@ impl App {
             });
     }
 
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        self.save_settings();
+    }
+
+    fn toggle_topbar(&mut self) {
+        self.topbar_open = !self.topbar_open;
+        self.save_settings();
+    }
+
+    fn sidebar_button(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let (label, tip) = if self.sidebar_open {
+            ("Hide sidebar", "Hide sidebar (Ctrl+\\)")
+        } else {
+            ("Show sidebar", "Show sidebar (Ctrl+\\)")
+        };
+        let open = self.sidebar_open;
+        if icon_button(ui, p, label, |painter, r, col| sidebar_icon(painter, r.center(), col, open))
+            .on_hover_text(tip)
+            .clicked()
+        {
+            self.toggle_sidebar();
+        }
+    }
+
+    fn topbar_button(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let up = self.topbar_open;
+        let (label, tip) = if up {
+            ("Hide top bar", "Hide top bar (Ctrl+Shift+\\)")
+        } else {
+            ("Show top bar", "Show top bar (Ctrl+Shift+\\)")
+        };
+        if icon_button(ui, p, label, |painter, r, col| chevron(painter, r.center(), col, up))
+            .on_hover_text(tip)
+            .clicked()
+        {
+            self.toggle_topbar();
+        }
+    }
+
+    /// The top bar folded away: a thin strip with the two toggles.
+    fn folded_topbar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        egui::Panel::top("top-folded")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.paper)
+                    .inner_margin(egui::Margin::symmetric(10, 2)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    self.sidebar_button(ui, p);
+                    ui.with_layout(ELayout::right_to_left(Align::Center), |ui| {
+                        self.topbar_button(ui, p);
+                    });
+                });
+            });
+    }
+
     fn topbar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let pinned = self.idx().is_some_and(|i| self.notes[i].pinned);
         let pin_label = if pinned { "★ Pinned" } else { "☆ Pin" };
@@ -908,7 +1094,8 @@ impl App {
                 ]
                 .iter()
                 .map(|(t, d)| theme::pill_width(ui, t, d) + gap)
-                .sum();
+                .sum::<f32>()
+                    + 2.0 * (ICON_BTN + gap);
                 let fits = ui.available_width() >= seg_w + act_w + 24.0;
                 let views_ui = |this: &mut Self, ui: &mut egui::Ui| {
                     let sel = (!this.calendar).then_some(this.view as usize);
@@ -920,8 +1107,10 @@ impl App {
                 if fits {
                     // One row, actions right-aligned (added right-to-left, so reversed).
                     ui.horizontal(|ui| {
+                        self.sidebar_button(ui, p);
                         views_ui(self, ui);
                         ui.with_layout(ELayout::right_to_left(Align::Center), |ui| {
+                            self.topbar_button(ui, p);
                             for k in (0..4).rev() {
                                 self.top_action(ui, p, k, pin_label, pinned);
                             }
@@ -930,11 +1119,13 @@ impl App {
                 } else {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
+                        self.sidebar_button(ui, p);
                         views_ui(self, ui);
                         ui.end_row();
                         for k in 0..4 {
                             self.top_action(ui, p, k, pin_label, pinned);
                         }
+                        self.topbar_button(ui, p);
                     });
                 }
             });
@@ -1474,6 +1665,16 @@ impl App {
                 let mut to_send: Option<String> = None;
                 egui::Panel::bottom("ai-input").frame(pad(10)).show(ui, |ui| {
                     let id = egui::Id::new("ai-draft");
+                    // Talk: a finished transcript goes out with whatever was typed.
+                    match self.voice.poll() {
+                        Some(Ok(said)) if !self.busy => {
+                            let typed = self.draft.trim();
+                            to_send = Some(if typed.is_empty() { said } else { format!("{typed} {said}") });
+                        }
+                        Some(Ok(said)) => self.draft = format!("{} {said}", self.draft.trim()).trim().to_string(),
+                        Some(Err(e)) => self.err = e,
+                        None => {}
+                    }
                     if ui.ctx().memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) && !self.busy && !self.draft.trim().is_empty() {
                         to_send = Some(self.draft.trim().to_string());
                     }
@@ -1499,6 +1700,7 @@ impl App {
                                     to_send = Some(self.draft.trim().to_string());
                                 }
                             }
+                            self.talk_button(ui, p);
                         });
                     });
                 });
@@ -1603,6 +1805,54 @@ impl App {
             });
     }
 
+    /// Click to talk, click again to send what you said.
+    fn talk_button(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let ctx = ui.ctx().clone();
+        match &self.voice {
+            voice::Voice::Idle => {
+                if pill_ex(ui, p, "Talk", false, Deco::Dot(p.accent))
+                    .on_hover_text("Talk to Pengu (Ctrl+Shift+Space): click, speak, click again to send")
+                    .clicked()
+                {
+                    self.start_talking();
+                }
+            }
+            voice::Voice::Recording { since, .. } => {
+                let secs = since.elapsed().as_secs();
+                ctx.request_repaint_after(Duration::from_millis(250));
+                if pill_ex(ui, p, &format!("Done {}:{:02}", secs / 60, secs % 60), true, Deco::Dot(p.accent))
+                    .on_hover_text("Listening… click to send")
+                    .clicked()
+                {
+                    self.voice.stop(&ctx, &self.voice_lang);
+                }
+            }
+            voice::Voice::Transcribing { .. } => {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                ui.add_enabled(false, egui::Label::new(RichText::new("Writing it down…").size(13.0).color(p.ink_2)));
+            }
+        }
+        // The spoken language, shared with the desktop widget: click to switch.
+        let (label, tip) = if self.voice_lang == "ar" {
+            ("AR", "Talking in Arabic. Click for English")
+        } else {
+            ("EN", "Talking in English. Click for Arabic")
+        };
+        if pill(ui, p, label, false).on_hover_text(tip).clicked() {
+            self.voice_lang = if self.voice_lang == "ar" { "en" } else { "ar" }.into();
+            if !cfg!(test) {
+                voice::set_lang(&self.voice_lang);
+            }
+        }
+    }
+
+    fn start_talking(&mut self) {
+        self.err.clear();
+        if let Err(e) = self.voice.start() {
+            self.err = e;
+        }
+    }
+
     fn settings_modal(&mut self, ctx: &egui::Context, p: &Palette) {
         if !self.settings_open {
             return;
@@ -1655,7 +1905,7 @@ impl App {
                 changed = true;
             }
             changed |= field(ui, "Model (any name the server accepts)", &mut self.ai.model, "e.g. deepseek-flash", false);
-            changed |= field(ui, "API key", &mut self.ai.key, "paste your key (not needed for Ollama / LM Studio / Bonsai)", true);
+            changed |= field(ui, "API key", &mut self.ai.key, "paste your key (not needed for Ollama / LM Studio)", true);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 test = primary(ui, p, "Test connection").clicked();
@@ -1732,6 +1982,66 @@ impl App {
 }
 
 /// A small trash can (the UI fonts have no trash glyph): lid with a handle, tapered bin, two ribs.
+const ICON_BTN: f32 = 28.0;
+
+/// Square button with a painted icon (the UI fonts lack most symbols).
+fn icon_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(Vec2::splat(ICON_BTN), Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        if r.hovered() {
+            ui.painter().rect_filled(rect.shrink(2.0), 7, p.paper2);
+        }
+        paint(ui.painter(), rect, if r.hovered() { p.ink } else { p.ink_2 });
+    }
+    r
+}
+
+/// A window with a side column; the column is filled while the sidebar is open.
+fn sidebar_icon(painter: &egui::Painter, c: egui::Pos2, col: Color32, open: bool) {
+    let r = egui::Rect::from_center_size(c, Vec2::new(16.0, 13.0));
+    let s = Stroke::new(1.4, col);
+    painter.rect_stroke(r, 3, s, egui::StrokeKind::Middle);
+    let x = r.left() + 5.5;
+    painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], s);
+    if open {
+        painter.rect_filled(egui::Rect::from_min_max(r.min, egui::pos2(x, r.bottom())), 3, col);
+    }
+}
+
+/// A circular arrow, turned by `angle` (spins while syncing).
+fn refresh_icon(painter: &egui::Painter, c: egui::Pos2, col: Color32, angle: f32) {
+    let r = 5.5;
+    let at = |a: f32, d: f32| c + Vec2::new((a + angle).cos() * d, (a + angle).sin() * d);
+    let pts: Vec<egui::Pos2> = (0..=20).map(|k| at(0.5 + k as f32 * 0.25, r)).collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(1.5, col)));
+    // arrowhead at the start of the arc
+    let tip = at(0.5, r);
+    let back = at(0.5 + 0.55, r);
+    let dir = (tip - back).normalized();
+    let side = Vec2::new(-dir.y, dir.x);
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip + dir * 2.5, tip - dir * 1.5 + side * 2.6, tip - dir * 1.5 - side * 2.6],
+        col,
+        Stroke::NONE,
+    ));
+}
+
+/// ^ (fold up) or v (unfold).
+fn chevron(painter: &egui::Painter, c: egui::Pos2, col: Color32, up: bool) {
+    let (w, h) = (5.0, if up { -2.5 } else { 2.5 });
+    painter.add(egui::Shape::line(
+        vec![c + Vec2::new(-w, -h), c + Vec2::new(0.0, h), c + Vec2::new(w, -h)],
+        Stroke::new(1.6, col),
+    ));
+}
+
 fn trash_icon(painter: &egui::Painter, c: egui::Pos2, col: Color32) {
     let s = Stroke::new(1.4, col);
     let v = |x: f32, y: f32| c + Vec2::new(x, y);
@@ -1882,6 +2192,58 @@ mod tests {
         assert_eq!(h.state().notes.len(), before);
         assert_eq!(h.state().notes[1].id, id, "back in its place");
         assert!(h.state().trashed.is_none());
+    }
+
+    #[test]
+    fn sidebar_and_topbar_fold() {
+        let mut h = fresh();
+        assert!(h.query_by_label("Search notes or #tags…").is_some() || h.query_by_label("+ New").is_some());
+        h.get_by_label("Hide sidebar").click();
+        h.run_steps(3);
+        assert!(!h.state().sidebar_open);
+        assert!(h.query_by_label("+ New").is_none());
+        shot(&mut h, "22-sidebar-hidden");
+        h.get_by_label("Hide top bar").click();
+        h.run_steps(3);
+        assert!(!h.state().topbar_open);
+        assert!(h.query_by_label("Calendar").is_none());
+        assert!(h.query_by_label("Link").is_none(), "formatting toolbar folds too");
+        shot(&mut h, "23-both-folded");
+        h.get_by_label("Show sidebar").click();
+        h.run_steps(3);
+        assert!(h.state().sidebar_open);
+        shot(&mut h, "24-topbar-folded");
+        h.get_by_label("Show top bar").click();
+        h.run_steps(3);
+        assert!(h.state().topbar_open);
+        assert!(h.query_by_label("Calendar").is_some());
+        // shortcuts
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Backslash);
+        h.run_steps(2);
+        assert!(!h.state().sidebar_open);
+        h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Backslash);
+        h.run_steps(2);
+        assert!(!h.state().topbar_open);
+        assert!(h.state().sidebar_open == false, "shift version leaves the sidebar alone");
+        // Ctrl+F brings the sidebar back for the search box
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run_steps(2);
+        assert!(h.state().sidebar_open);
+        let saved = model::load_settings();
+        assert!(saved.sidebar_open && !saved.topbar_open, "remembered");
+    }
+
+    #[test]
+    fn talk_button() {
+        let mut h = fresh();
+        h.state_mut().ai_open = true;
+        h.run_steps(4);
+        shot(&mut h, "26-talk-button");
+        // No whisper in the test data dir: a clear message, and nothing records.
+        h.get_by_label("Talk").click();
+        h.run_steps(3);
+        assert!(matches!(h.state().voice, voice::Voice::Idle));
+        assert!(h.state().err.contains("Voice needs whisper.cpp"), "{}", h.state().err);
     }
 
     #[test]
@@ -2042,7 +2404,7 @@ mod tests {
         let mut h = fresh();
         h.state_mut().ai_open = true;
         h.state_mut().dark = true;
-        h.state_mut().ai.model = "a-really-long-model-name-like-bonsai-8b-instruct-q4".into();
+        h.state_mut().ai.model = "a-really-long-model-name-like-llama-8b-instruct-q4".into();
         h.set_size(Vec2::new(920.0, 600.0));
         h.run_steps(4);
         shot(&mut h, "12-narrow");

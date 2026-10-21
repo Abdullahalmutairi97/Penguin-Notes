@@ -2490,13 +2490,16 @@ dependencies = [
 name = "penguin-notes"
 version = "0.6.0"
 dependencies = [
+ "base64",
  "chrono",
  "eframe",
  "egui_kittest",
  "roxmltree",
+ "rustls",
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots",
 ]
 
 [[package]]

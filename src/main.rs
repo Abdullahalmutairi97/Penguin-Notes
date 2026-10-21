@@ -1,6 +1,8 @@
 mod ai;
 mod app;
+mod applenotes;
 mod calendar;
+mod cli;
 mod edit;
 mod hl;
 mod icloud;
@@ -10,8 +12,12 @@ mod mirror;
 mod model;
 mod pengu;
 mod theme;
+mod voice;
 
 fn main() -> eframe::Result {
+    if let Some(code) = cli::run() {
+        std::process::exit(code);
+    }
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])

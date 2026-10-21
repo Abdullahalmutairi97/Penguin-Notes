@@ -1,4 +1,5 @@
-//! iPhone sync: iCloud calendar (CalDAV, background thread) and the Markdown notes folder.
+//! iPhone sync: iCloud calendar (CalDAV, background thread), Apple Notes (IMAP, background
+//! thread) and the Markdown notes folder.
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use eframe::egui::{self, Align, Layout as ELayout, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 
 use super::App;
+use crate::applenotes;
 use crate::icloud::{self, Creds, LocalOp, Outcome};
 use crate::ics::Event;
 use crate::mirror;
@@ -25,6 +27,8 @@ pub struct SyncCfg {
     pub icloud: Creds,
     #[serde(default)]
     pub folder: String,
+    #[serde(default)]
+    pub apple: applenotes::Creds,
 }
 
 fn load<T: for<'de> Deserialize<'de> + Default>(name: &str) -> T {
@@ -56,6 +60,32 @@ pub struct SyncRt {
     mirror_msg: String,
     pub open: bool,
     force: bool,
+    apple: AppleRt,
+}
+
+/// Apple Notes runs: one at a time, every minute and shortly after an edit.
+#[derive(Default)]
+struct AppleRt {
+    state: applenotes::State,
+    rx: Option<Receiver<Result<applenotes::Outcome, String>>>,
+    msg: String,
+    failed: bool,
+    last: Option<Instant>,
+    checked: Option<Instant>,
+    sent_sig: u64,
+    cur_sig: u64,
+    sig_at: Option<Instant>,
+    force: bool,
+}
+
+const APPLE_EVERY: Duration = Duration::from_secs(60);
+
+fn notes_sig(notes: &[Note]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for n in notes {
+        (&n.id, &n.title, &n.body).hash(&mut h);
+    }
+    h.finish()
 }
 
 impl SyncRt {
@@ -64,6 +94,10 @@ impl SyncRt {
             cfg: load("sync-settings.json"),
             state: load("calendar-sync.json"),
             mirror: load("folder-sync.json"),
+            apple: AppleRt {
+                state: load("applenotes-sync.json"),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -93,6 +127,38 @@ impl SyncRt {
 
     pub fn sync_now(&mut self) {
         self.force = true;
+    }
+
+    /// Apple Notes sync is set up.
+    pub fn notes_on(&self) -> bool {
+        self.cfg.apple.enabled
+    }
+
+    pub fn notes_busy(&self) -> bool {
+        self.apple.rx.is_some()
+    }
+
+    /// Pull the iPhone's note changes now instead of on the next minute.
+    pub fn notes_sync_now(&mut self) {
+        self.apple.failed = false;
+        self.apple.force = true;
+    }
+
+    /// Hover text for the refresh button.
+    pub fn notes_status(&self) -> String {
+        let a = &self.apple;
+        if a.rx.is_some() {
+            "Syncing with iPhone…".into()
+        } else if a.failed {
+            format!("iPhone sync failed: {} (click to retry)", a.msg)
+        } else if a.state.last_ok > 0 {
+            let t = chrono::DateTime::from_timestamp_millis(a.state.last_ok)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Local);
+            format!("Synced with iPhone at {}. Click to sync now", t.format("%H:%M"))
+        } else {
+            "Sync with iPhone now".into()
+        }
     }
 }
 
@@ -182,6 +248,7 @@ impl App {
             }
             ctx.request_repaint_after(Duration::from_secs(2));
         }
+        self.apple_tick(ctx);
         // Notes folder.
         if !self.sync.cfg.folder.trim().is_empty()
             && self
@@ -211,6 +278,97 @@ impl App {
             save("folder-sync.json", &self.sync.mirror);
             ctx.request_repaint_after(Duration::from_secs(3));
         }
+    }
+
+    fn apple_tick(&mut self, ctx: &egui::Context) {
+        let a = &mut self.sync.apple;
+        if let Some(Ok(res)) = a.rx.as_ref().map(|rx| rx.try_recv()) {
+            a.rx = None;
+            match res {
+                Ok(mut out) => {
+                    for op in &out.ops {
+                        match op {
+                            applenotes::Op::Put { id, title, body, base } => {
+                                match self.notes.iter_mut().find(|n| &n.id == id) {
+                                    // Edited here while the run was out: keep ours, it goes up next time.
+                                    Some(n) if Some(n.updated) != *base => {
+                                        if let Some(e) = out.state.notes.get_mut(id) {
+                                            e.hash = 0;
+                                        }
+                                    }
+                                    Some(n) => {
+                                        n.title = title.clone();
+                                        n.body = body.clone();
+                                        n.updated = model::now_ms();
+                                    }
+                                    None if base.is_none() => self.notes.insert(
+                                        0,
+                                        Note {
+                                            id: id.clone(),
+                                            title: title.clone(),
+                                            body: body.clone(),
+                                            tags: String::new(),
+                                            updated: model::now_ms(),
+                                            pinned: false,
+                                        },
+                                    ),
+                                    // Deleted here meanwhile.
+                                    None => {
+                                        out.state.notes.remove(id);
+                                    }
+                                }
+                            }
+                            applenotes::Op::Delete { id, base } => {
+                                self.notes.retain(|n| &n.id != id || n.updated != *base);
+                            }
+                        }
+                    }
+                    if !out.ops.is_empty() {
+                        self.dirty = true;
+                        if self.idx().is_none() {
+                            self.active = self.notes.first().map(|n| n.id.clone());
+                        }
+                    }
+                    let a = &mut self.sync.apple;
+                    a.state = out.state;
+                    save("applenotes-sync.json", &a.state);
+                    a.failed = false;
+                    a.msg = format!("Synced {}", chrono::Local::now().format("%H:%M"));
+                    let s = notes_sig(&self.notes);
+                    a.sent_sig = s;
+                    a.cur_sig = s;
+                }
+                Err(e) => {
+                    a.failed = true;
+                    a.msg = e;
+                }
+            }
+        }
+        let a = &mut self.sync.apple;
+        if !self.sync.cfg.apple.enabled || a.rx.is_some() || a.checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        a.checked = Some(Instant::now());
+        let s = notes_sig(&self.notes);
+        if s != a.cur_sig {
+            a.cur_sig = s;
+            a.sig_at = Some(Instant::now());
+        }
+        let edited = s != a.sent_sig && a.sig_at.is_some_and(|t| t.elapsed() > AFTER_EDIT);
+        let due = a.last.is_none_or(|t| t.elapsed() > APPLE_EVERY);
+        if a.force || due || (edited && !a.failed) {
+            a.force = false;
+            a.last = Some(Instant::now());
+            a.sent_sig = s;
+            let (tx, rx) = channel();
+            a.rx = Some(rx);
+            let (creds, notes, state, c) = (self.sync.cfg.apple.clone(), self.notes.clone(), a.state.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(applenotes::sync(&creds, &notes, state));
+                c.request_repaint();
+            });
+        }
+        ctx.request_repaint_after(Duration::from_secs(2));
     }
 
     pub(super) fn sync_modal(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -281,10 +439,50 @@ impl App {
             ui.separator();
             ui.add_space(6.0);
 
-            // ---- Notes
-            ui.label(RichText::new("Notes").size(17.0).family(bold()));
+            // ---- Apple Notes
+            ui.label(RichText::new("Apple Notes").size(17.0).family(bold()));
             ui.label(
-                RichText::new("Apple Notes can't be reached from Linux, so every note is kept as a Markdown file in a folder instead. Sync that folder to your iPhone and open it in Obsidian (free): checkboxes, [[links]] and ==highlights== all work there, and edits on the phone come back here.")
+                RichText::new("Every note goes to the Notes app on your iPhone through a mail account's Notes folder, and notes you write or change there come back here. They show as plain text: the Markdown is kept as it is.")
+                    .size(13.0)
+                    .color(p.ink_2),
+            );
+            ui.add_space(4.0);
+            changed |= field(ui, "IMAP server", &mut self.sync.cfg.apple.host, "mail.example.com", false);
+            changed |= field(ui, "User name", &mut self.sync.cfg.apple.user, "notes", false);
+            changed |= field(ui, "Password", &mut self.sync.cfg.apple.pass, "", true);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let a = &mut self.sync.apple;
+                let on = self.sync.cfg.apple.enabled;
+                if primary(ui, p, if on { "Sync now" } else { "Connect & sync" }).clicked() {
+                    self.sync.cfg.apple.enabled = true;
+                    a.failed = false;
+                    a.force = true;
+                    changed = true;
+                }
+                if on && pill(ui, p, "Turn off", false).clicked() {
+                    self.sync.cfg.apple.enabled = false;
+                    changed = true;
+                }
+                let (txt, col) = if a.rx.is_some() {
+                    ("Syncing…".to_string(), p.ink_2)
+                } else if a.failed {
+                    (a.msg.clone(), p.accent)
+                } else {
+                    (a.msg.clone(), p.ink_2)
+                };
+                ui.add(egui::Label::new(RichText::new(txt).size(12.5).color(col)).wrap());
+            });
+            ui.label(RichText::new("On the iPhone: Settings > Apps > Mail > Mail Accounts > Add Account > Other > Add Mail Account, with the same server and login, then turn on Notes for it.").size(12.5).color(p.ink_3));
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // ---- Notes folder
+            ui.label(RichText::new("Notes folder").size(17.0).family(bold()));
+            ui.label(
+                RichText::new("Every note can also be kept as a Markdown file in a folder. Sync that folder to your iPhone and open it in Obsidian (free): checkboxes, [[links]] and ==highlights== all work there, and edits on the phone come back here.")
                     .size(13.0)
                     .color(p.ink_2),
             );
@@ -438,5 +636,47 @@ mod tests {
         h.state_mut().calendar = false;
         h.run_steps(3);
         shot(&mut h, "18-iphone-sync-settings");
+    }
+
+    #[test]
+    fn refresh_button_syncs_notes() {
+        let app = App::from_parts(model::load_notes_default(), Settings::default());
+        let mut h = Harness::builder()
+            .with_size([1280.0, 800.0])
+            .wgpu()
+            .build_ui_state(|ui, a: &mut App| a.draw(ui), app);
+        h.run_steps(3);
+        assert!(h.query_by_label("Refresh notes").is_none(), "hidden until Apple Notes sync is on");
+        // On, but with no server: every run fails at once without touching the network.
+        h.state_mut().sync.cfg.apple.enabled = true;
+        h.run_steps(3);
+        for _ in 0..100 {
+            h.run_steps(1);
+            if !h.state().sync.notes_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(h.state().sync.notes_status().starts_with("iPhone sync failed"));
+        h.get_by_label("Refresh notes").click();
+        h.run_steps(1);
+        assert!(h.state().sync.apple.force || h.state().sync.notes_busy(), "click starts a sync");
+        h.run_steps(3);
+        shot(&mut h, "25-refresh-notes");
+    }
+
+    #[test]
+    fn apple_notes_settings_render() {
+        let mut app = App::from_parts(model::load_notes_default(), Settings::default());
+        app.sync.cfg.apple = applenotes::Creds { host: "vps.example.ts.net".into(), user: "notes".into(), pass: "x".into(), enabled: false };
+        app.sync.open = true;
+        let mut h = Harness::builder()
+            .with_size([1280.0, 1100.0])
+            .wgpu()
+            .build_ui_state(|ui, a: &mut App| a.draw(ui), app);
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("Apple Notes").is_some());
+        assert!(h.state().sync.apple.rx.is_none(), "off until connected");
+        shot(&mut h, "19-apple-notes-settings");
     }
 }

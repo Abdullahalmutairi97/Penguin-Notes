@@ -42,13 +42,12 @@ impl Default for AiCfg {
 }
 
 /// (name, endpoint, default model)
-pub const PRESETS: [(&str, &str, &str); 7] = [
+pub const PRESETS: [(&str, &str, &str); 6] = [
     ("DeepSeek", "https://api.deepseek.com", "deepseek-flash"),
     ("OpenAI", "https://api.openai.com/v1", ""),
     ("OpenRouter", "https://openrouter.ai/api/v1", ""),
     ("Ollama", "http://localhost:11434/v1", ""),
     ("LM Studio", "http://localhost:1234/v1", ""),
-    ("Bonsai", "http://127.0.0.1:8099/v1", "bonsai"),
     ("Custom", "", ""),
 ];
 
@@ -63,6 +62,11 @@ pub struct Settings {
     /// Pengu's quick-action pills and toggles are expanded (collapsed with the arrow)
     #[serde(default = "yes")]
     pub actions_open: bool,
+    #[serde(default = "yes")]
+    pub sidebar_open: bool,
+    /// The top bar and formatting toolbar are shown (folded into a thin strip otherwise)
+    #[serde(default = "yes")]
+    pub topbar_open: bool,
 }
 
 fn yes() -> bool {
@@ -76,6 +80,8 @@ impl Default for Settings {
             ai: AiCfg::default(),
             pengu_edits: true,
             actions_open: true,
+            sidebar_open: true,
+            topbar_open: true,
         }
     }
 }
@@ -126,6 +132,42 @@ pub fn load_notes() -> Vec<Note> {
     } else {
         notes
     }
+}
+
+/// A notes file exactly as it is on disk (no welcome notes for an empty one).
+pub fn read_list(name: &str) -> Option<Vec<Note>> {
+    serde_json::from_str(&std::fs::read_to_string(data_dir().join(name)).ok()?).ok()
+}
+
+pub fn mtime(name: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(data_dir().join(name)).ok()?.modified().ok()
+}
+
+/// Bring changes another process saved (`disk`) into `mine`. `since` is when the two last
+/// agreed: a note only one side has is new there if it changed after that, else the other
+/// side deleted it. For notes both have, the later edit wins. Returns true if `mine` changed.
+pub fn merge(mine: &mut Vec<Note>, disk: Vec<Note>, since: i64) -> bool {
+    let mut changed = false;
+    mine.retain(|n| {
+        let keep = n.updated > since || disk.iter().any(|d| d.id == n.id);
+        changed |= !keep;
+        keep
+    });
+    for d in disk {
+        match mine.iter_mut().find(|n| n.id == d.id) {
+            Some(n) if d.updated > n.updated => {
+                *n = d;
+                changed = true;
+            }
+            Some(_) => {}
+            None if d.updated > since => {
+                mine.insert(0, d);
+                changed = true;
+            }
+            None => {}
+        }
+    }
+    changed
 }
 
 pub fn save_notes(notes: &[Note]) {
@@ -239,6 +281,27 @@ mod tests {
 
     fn n(id: &str, title: &str, body: &str) -> Note {
         Note { id: id.into(), title: title.into(), body: body.into(), tags: String::new(), updated: 5, pinned: false }
+    }
+
+    #[test]
+    fn merges_what_another_process_saved() {
+        let since = 100;
+        let mk = |id: &str, body: &str, updated: i64| Note { updated, ..n(id, id, body) };
+        let mut mine = vec![mk("a", "mine", 150), mk("b", "old", 50), mk("c", "made here", 120), mk("gone", "x", 50)];
+        let disk = vec![
+            mk("a", "theirs", 140),       // older than my edit: mine stays
+            mk("b", "pengu added", 130),  // edited there
+            mk("new", "from pengu", 130), // made there
+            mk("deleted-here", "x", 40),  // I deleted it before `since`
+        ];
+        assert!(merge(&mut mine, disk, since));
+        let get = |id: &str| mine.iter().find(|n| n.id == id).map(|n| n.body.clone());
+        assert_eq!(get("a").as_deref(), Some("mine"));
+        assert_eq!(get("b").as_deref(), Some("pengu added"));
+        assert_eq!(get("c").as_deref(), Some("made here"), "made here after `since`");
+        assert_eq!(get("new").as_deref(), Some("from pengu"));
+        assert_eq!(get("gone"), None, "deleted there");
+        assert_eq!(get("deleted-here"), None);
     }
 
     #[test]

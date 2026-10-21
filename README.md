@@ -2,6 +2,8 @@
 
 Markdown notes with a local AI sidebar (Pengu), voice input that runs on your computer, and sync with your iPhone's Calendar and Notes apps.
 
+**New here? Read the [easy step-by-step guide](GUIDE.md).**
+
 ## Download
 
 Get it from the **[latest release](https://github.com/Abdullahalmutairi97/Penguin-Notes/releases/latest)**.

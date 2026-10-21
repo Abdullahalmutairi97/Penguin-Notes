@@ -1,3 +1,5 @@
+📖 **Step-by-step guide for everyone:** https://github.com/Abdullahalmutairi97/Penguin-Notes/blob/main/GUIDE.md
+
 ## Download
 
 **Windows:** download **PenguinNotes-Setup.exe** below and open it. Windows may say it "protected your PC" because the app isn't signed yet: click **More info > Run anyway**.
